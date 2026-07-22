@@ -1,128 +1,156 @@
 # transcript-bridge
 
-**Loss-aware conversion between agent transcript formats.**
+**Loss-aware, vendor-neutral transcript format conversion for AI agents.**
 
-Convert session logs across Claude Code JSONL, OpenAI messages, Codex traces, and a canonical JSONL — without silently dropping metadata. Every field that cannot be represented in the target format is reported in a loss summary. Use `--strict` to fail on any loss.
+Convert agent session logs between Claude Code JSONL, OpenAI messages, Codex traces, and a canonical JSONL — without silently dropping metadata. Run with Claude, replay with OpenAI, analyze with Codex, and know exactly what survived the trip.
 
-```bash
-# Convert a Claude Code transcript to OpenAI messages
-transcript-bridge session.jsonl --from claude_code_jsonl --to openai_messages -o session-openai.json
-
-# Loss report printed to stderr
-loss report: 1 field(s) could not be represented
-  - content text cache_control: OpenAI messages have no slot for Anthropic cache_control blocks
-```
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
+![License: MIT](https://img.shields.io/badge/License-MIT-green)
+![Deps: 0](https://img.shields.io/badge/Deps-0-orange)
+![Self-check](https://img.shields.io/badge/Self--check-passing-brightgreen)
 
 ---
 
 ## Table of contents
 
-1. [Why this exists](#why-this-exists)
-2. [Supported formats](#supported-formats)
-3. [Installation](#installation)
-4. [Quick start](#quick-start)
-5. [CLI reference](#cli-reference)
-6. [Architecture & methodology](#architecture--methodology)
-7. [Implementation](#implementation)
-8. [Use cases](#use-cases)
-9. [Performance](#performance)
-10. [Development](#development)
-11. [Contributing](#contributing)
-12. [License](#license)
+1. [The problem it solves](#the-problem-it-solves)
+2. [The methodology](#the-methodology)
+3. [How it works (mechanism)](#how-it-works-mechanism)
+4. [The canonical format](#the-canonical-format)
+5. [Install](#install)
+6. [Usage](#usage)
+7. [Supported formats](#supported-formats)
+8. [Loss model](#loss-model)
+9. [Project layout](#project-layout)
+10. [Security](#security)
+11. [Scope (v1)](#scope-v1)
+12. [Self-check](#self-check)
+13. [License](#license)
 
 ---
 
-## Why this exists
+## The problem it solves
 
-Agent stacks are multiplying. Each one records conversations differently:
+Agent stacks are multiplying, and each one records conversations differently. Switching formats for debugging, replay, or analysis usually means **losing information silently**.
 
-- **Claude Code** emits JSONL with Anthropic-style content blocks (`text`, `tool_use`, `tool_result`), `cache_control`, and per-turn metadata.
-- **OpenAI** uses a flat array of `{role, content, tool_calls}` messages with `tool_call_id` and `name` fields.
-- **Codex** produces OpenAI-like traces plus `usage`, `checkpoint`, `command`, `cwd`, and other CLI-specific fields.
+| Without transcript-bridge | With transcript-bridge |
+|---|---|
+| Convert Claude → OpenAI and lose `cache_control` silently | Every lost field is reported to stderr |
+| Replay a Codex trace in Claude and drop `usage`/`checkpoint` metadata | Extra fields are stashed in `_meta.source` and re-emitted when possible |
+| Round-trip a transcript and find the output no longer matches the input | `selfcheck.py` proves round-trip honesty |
+| Audit which format dropped what | Loss report gives path, reason, source format, target format, and value |
 
-Switching between these formats for debugging, replay, or analysis usually means **losing information silently**. `transcript-bridge` makes the loss explicit. It converts the conversation into a small canonical model, then re-serializes it into the target format while reporting every field that had no native home.
-
-### What makes this different
-
-| Concern | Typical converter | transcript-bridge |
-|---|---|---|
-| Silent data loss | Common | Never — every loss is reported |
-| Round-trip honesty | Rare | Core design goal, validated by `selfcheck.py` |
-| Local/offline | Sometimes | Always — stdlib only, no network |
-| Telemetry | Often present | None |
+The key idea: **you don't change the agent. transcript-bridge normalizes the transcript.**
 
 ---
 
-## Supported formats
+## The methodology
 
-| Format | Read | Write | Notes |
-|---|---|---|---|
-| `claude_code_jsonl` | ✅ | ✅ | Anthropic-style content blocks (`text`, `tool_use`, `tool_result`) |
-| `openai_messages` | ✅ | ✅ | JSON array of `{role, content, tool_calls}` messages |
-| `codex` | ✅ | ✅ | Codex CLI traces with extra metadata (`usage`, `checkpoint`, etc.) |
+Three design choices keep the tool small, honest, and composable:
 
-Planned follow-up formats: Gemini transcripts, LangSmith traces.
+1. **Canonical-first, not format-first.**  
+   Every input is normalized into one vendor-neutral envelope. Writers translate the canonical model, not each pairwise format difference.
+
+2. **Block arrays as the source of truth.**  
+   Anthropic-style content blocks (`text`, `tool_use`, `tool_result`) preserve ordering of text, tools, and cache hints in a single list. OpenAI's `tool_calls`/`role: tool` shape is derived from that list.
+
+3. **Loss is a first-class output.**  
+    `--strict` turns any loss into a non-zero exit. Loss entries are stored in `_meta.loss` so the canonical record remembers what could not be represented.
+
+```mermaid
+flowchart LR
+    A["Claude Code JSONL"] -- reader --> C["Canonical turns"]
+    B["OpenAI messages"] -- reader --> C
+    D["Codex traces"] -- reader --> C
+    C -- writer --> E["Claude Code JSONL"]
+    C -- writer --> F["OpenAI messages"]
+    C -- writer --> G["Codex traces"]
+    C -- analyzer --> H["Loss report"]
+```
 
 ---
 
-## Installation
+## How it works (mechanism)
 
-### pipx (recommended)
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI
+    participant Reader
+    participant Canonical
+    participant Writer
+    participant LossReport
+
+    User->>CLI: transcript-bridge in.jsonl --from A --to B
+    CLI->>Reader: read source text
+    Reader->>Canonical: list[CanonicalTurn]
+    CLI->>Writer: write turns to target format
+    Writer->>LossReport: emit loss entries
+    Writer-->>CLI: output text
+    LossReport-->>CLI: human-readable report
+    CLI-->>User: stdout: target text
+    CLI-->>User: stderr: loss report
+```
+
+The pipeline has three stages:
+
+- **Reader** parses source text into canonical turns.
+- **Canonical envelope** stores each turn as a JSONL line with `role`, `content`, derived `tool_calls`/`tool_results`, provider/model hints, timestamp, and `_meta`.
+- **Writer** re-serializes turns into the target format and reports any field with no native home.
+
+Nothing is silently dropped. Unknown fields go into `_meta.source`; unsupported fields become loss entries.
+
+---
+
+## The canonical format
+
+One JSONL line per conversation turn:
+
+```jsonl
+{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"call_1","name":"Read","input":{"file_path":"/x"}}],"tool_calls":[{"type":"tool_use","id":"call_1","name":"Read","input":{"file_path":"/x"}}],"tool_results":null,"provider":"anthropic","model":null,"ts":"2026-07-22T12:00:00+00:00","_meta":{"loss":[],"source":{}}}
+{"role":"tool","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}],"tool_calls":null,"tool_results":[{"tool_use_id":"call_1","content":"contents"}],"provider":"openai","model":null,"ts":"2026-07-22T12:00:01+00:00","_meta":{"loss":[],"source":{"role":"tool","tool_call_id":"call_1","content":"contents","name":"Read"}}}
+```
+
+### Fields
+
+| Field | Meaning |
+|---|---|
+| `role` | `user`, `assistant`, `system`, `tool` |
+| `content` | Canonical truth: string or array of Anthropic-style blocks |
+| `tool_calls` | Derived view of `tool_use` blocks inside `content` |
+| `tool_results` | Derived view of `tool_result` blocks inside `content` |
+| `provider` | Source provider hint: `anthropic`, `openai`, `codex`, ... |
+| `model` | Model name if known |
+| `ts` | ISO-8601 timestamp |
+| `_meta` | Always present. Holds `loss` entries and `source` record. |
+
+---
+
+## Install
 
 ```bash
 pipx install .
 ```
 
-### pip
+Requires Python 3.10+. Zero runtime dependencies.
 
-```bash
-python -m pip install .
-```
-
-### Run from source
+To run from source:
 
 ```bash
 python -m transcript_bridge.cli formats
 ```
 
-No external dependencies are required. The tool uses only the Python standard library.
-
 ---
 
-## Quick start
+## Usage
 
-### 1. List supported formats
-
-```bash
-transcript-bridge formats
-```
-
-Output:
-
-```
-claude_code_jsonl
-codex
-openai_messages
-```
-
-### 2. Convert a Claude Code transcript to OpenAI messages
-
-Create a sample Claude Code JSONL file:
-
-```bash
-cat > session.jsonl <<'EOF'
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll read that.","cache_control":{"type":"ephemeral"}},{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"/x"}}]},"timestamp":"2026-07-22T12:00:00Z"}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"file contents"}]},"timestamp":"2026-07-22T12:00:01Z"}
-EOF
-```
-
-Run the conversion:
+### Convert a Claude Code transcript to OpenAI messages
 
 ```bash
 transcript-bridge session.jsonl --from claude_code_jsonl --to openai_messages -o session-openai.json
 ```
 
-Stdout/file output (`session-openai.json`):
+The file output:
 
 ```json
 [
@@ -148,98 +176,49 @@ Stdout/file output (`session-openai.json`):
 ]
 ```
 
-Stderr output:
+The stderr report:
 
 ```
 loss report: 1 field(s) could not be represented
   - content text cache_control: OpenAI messages have no slot for Anthropic cache_control blocks
 ```
 
-### 3. Fail on loss
+### Fail on loss
 
 ```bash
 transcript-bridge session.jsonl --from claude_code_jsonl --to openai_messages --strict
-# exits with code 2 because cache_control cannot be represented
+# exits with code 2 if any loss occurred
 ```
 
-### 4. Read from stdin
+### Read from stdin
 
 ```bash
 cat session.jsonl | transcript-bridge - --from claude_code_jsonl --to codex
 ```
 
----
+### List supported formats
 
-## CLI reference
-
-```
-transcript-bridge <file> --from <fmt> --to <fmt> [-o out] [--strict]
+```bash
 transcript-bridge formats
 ```
 
-| Argument | Description |
-|---|---|
-| `file` | Input file path, or `-` for stdin |
-| `--from` | Source format (`claude_code_jsonl`, `openai_messages`, `codex`) |
-| `--to` | Target format |
-| `-o` | Output file (default: stdout) |
-| `--strict` | Exit with code 2 if any loss occurs |
+---
 
-Exit codes:
+## Supported formats
 
-- `0` — success, no loss (or loss ignored without `--strict`)
-- `1` — invalid arguments, missing file, or read error
-- `2` — loss occurred and `--strict` was used
+| Format | Read | Write | Notes |
+|---|---|---|---|
+| `claude_code_jsonl` | ✅ | ✅ | Anthropic-style content blocks (`text`, `tool_use`, `tool_result`) |
+| `openai_messages` | ✅ | ✅ | JSON array of `{role, content, tool_calls}` messages |
+| `codex` | ✅ | ✅ | Codex CLI traces with extra metadata (`usage`, `checkpoint`, etc.) |
+
+Adding a new format means adding a reader + writer module and one registry line.
 
 ---
 
-## Architecture & methodology
+## Loss model
 
-### Pipeline
-
-```mermaid
-flowchart LR
-    A["Input text\n(Claude / OpenAI / Codex)"] -- reader --> B["Canonical turns\nJSONL envelope"]
-    B -- writer --> C["Output text\n(target format)"]
-    B -- analyzer --> D["Loss report\nstderr"]
-```
-
-All conversions pass through a single canonical intermediate model:
-
-```json
-{
-  "role": "user|assistant|system|tool",
-  "content": "<string or block array>",
-  "tool_calls": [...],
-  "tool_results": [...],
-  "provider": "anthropic|openai|codex",
-  "model": "...",
-  "ts": "...",
-  "_meta": {
-    "loss": [...],
-    "source": {...}
-  }
-}
-```
-
-### Canonical design choices
-
-- **`content` as the source of truth.** It is either a plain string or an ordered array of Anthropic-style blocks (`text`, `tool_use`, `tool_result`). This captures system turns and tool interactions in one ordered list.
-- **Derived `tool_calls` and `tool_results`.** These are normalized views extracted from `content` for consumers that prefer OpenAI-style fields.
-- **`_meta` always present.** It holds loss entries from the last write operation and the original source record for debugging.
-- **Preserved ordering.** System turns and `cache_control` blocks stay in their original position inside `content`.
-
-### Loss model
-
-```mermaid
-flowchart TD
-    A["Canonical turn has field X"] --> B{"Does target format have a native slot for X?"}
-    B -- yes --> C["Emit natively"]
-    B -- no --> D["Add loss entry\npath / reason / value"]
-    D --> E["Continue writing"]
-```
-
-Each loss entry has the shape:
+A loss entry is created whenever a canonical field has no native slot in the target format:
 
 ```json
 {
@@ -251,181 +230,86 @@ Each loss entry has the shape:
 }
 ```
 
+### Common loss cases
+
+| Source field | Target | Outcome |
+|---|---|---|
+| Claude `cache_control` | OpenAI / Codex | Reported as loss |
+| OpenAI tool `name` | Claude Code JSONL | Reported as loss |
+| Codex `usage`, `checkpoint` | OpenAI messages | Reported as loss (re-emitted when writing back to Codex) |
+
+Loss entries are printed to stderr and stored in `_meta.loss` on each canonical turn.
+
 ---
 
-## Implementation
-
-### Project structure
+## Project layout
 
 ```
 transcript-bridge/
-  transcript_bridge/
-    __init__.py          # exports version and FORMATS registry
-    canonical.py         # canonical envelope + JSONL helpers
-    loss.py              # loss entry + report formatting
-    cli.py               # argparse CLI
-    formats/
-      __init__.py
-      claude_code.py     # Claude Code JSONL reader/writer
-      openai.py          # OpenAI messages reader/writer
-      codex.py           # Codex trace reader/writer
-  selfcheck.py           # round-trip + loss-report verification
-  pyproject.toml         # pipx-installable, stdlib only
-  README.md
-  LICENSE
-  docs/superpowers/specs/2026-07-22-transcript-bridge-design.md
-  docs/superpowers/plans/2026-07-22-transcript-bridge.md
+├── transcript_bridge/
+│   ├── __init__.py          # version + FORMATS registry
+│   ├── canonical.py         # canonical envelope + JSONL helpers
+│   ├── loss.py              # loss entry + report formatting
+│   ├── cli.py               # argparse CLI
+│   └── formats/
+│       ├── __init__.py
+│       ├── claude_code.py   # Claude Code JSONL reader/writer
+│       ├── openai.py        # OpenAI messages reader/writer
+│       └── codex.py         # Codex trace reader/writer
+├── selfcheck.py             # round-trip + loss-report verification
+├── pyproject.toml           # pipx-installable, stdlib only
+├── LICENSE                  # MIT
+└── README.md
 ```
 
-### Registry
+Source comments marked with `# ponytail:` are deliberate simplifications.
 
-Formats are registered in a simple table:
+---
 
-```python
-FORMATS = {
-    "claude_code_jsonl": (claude_code.read, claude_code.write),
-    "openai_messages":   (openai.read, openai.write),
-    "codex":             (codex.read, codex.write),
-}
-```
+## Security
 
-No dynamic plugin loading. Adding a format means adding a module and one registry line.
-
-### Format mapping highlights
-
-| Source field | Canonical representation | Target mapping |
-|---|---|---|
-| Claude `tool_use` block | `content[]` + `tool_calls[]` | OpenAI `tool_calls[]` |
-| Claude `tool_result` block | `content[]` + `tool_results[]` | OpenAI `role: tool` message |
-| OpenAI `tool_calls` | `content[]` + `tool_calls[]` | Claude `tool_use` block |
-| OpenAI `role: tool` | `content[]` + `tool_results[]` | Claude `tool_result` block |
-| OpenAI `name` on tool | `_meta.source._openai_name` | reported as loss in Claude output |
-| Claude `cache_control` | preserved in `content[]` | reported as loss in OpenAI/Codex output |
-| Codex `usage`, `checkpoint`, etc. | `_meta.source._codex_extra` | re-injected when writing back to Codex |
-
-### Coding principles
-
-- **Stdlib only.** No `pydantic`, `click`, `rich`, or network calls.
-- **Ponytail simplifications.** Marked with `# ponytail:` comments where a deliberate short-term shortcut is taken.
 - **Read-only on inputs.** Source files are never modified.
-- **No telemetry.** No HTTP requests, no logging services.
+- **No network calls.** The tool works fully offline.
+- **No telemetry.** No hosted backend, no upload, no logging service.
+- **Local only.** All processing happens on the machine that runs the CLI.
 
 ---
 
-## Use cases
+## Scope (v1)
 
-### 1. Debug Claude Code sessions with OpenAI tools
+**In:**
+- Claude Code JSONL, OpenAI messages, Codex traces
+- Canonical JSONL envelope
+- Loss reporting with `--strict`
+- CLI: `transcript-bridge <file> --from X --to Y [-o out] [--strict]`
+- `transcript-bridge formats`
+- One `selfcheck.py`, no external test framework
+- Stdlib only; Python 3.10+
 
-Record a session with Claude Code, convert to OpenAI messages, and replay through an OpenAI-based evaluator or linter.
-
-```bash
-transcript-bridge .claude/sessions/latest.jsonl \
-  --from claude_code_jsonl \
-  --to openai_messages \
-  -o replay.json
-```
-
-### 2. Audit tool-call chains across formats
-
-Convert a transcript to canonical JSONL and inspect the ordered block sequence:
-
-```bash
-transcript-bridge session.jsonl --from claude_code_jsonl --to claude_code_jsonl -o canonical.jsonl
-# (identity conversion normalizes into the canonical envelope)
-```
-
-### 3. Archive Codex runs in Claude-readable form
-
-```bash
-transcript-bridge codex-trace.jsonl --from codex --to claude_code_jsonl -o archive.jsonl
-```
-
-### 4. CI gate: fail if conversion is lossy
-
-```bash
-if ! transcript-bridge input.jsonl --from openai_messages --to claude_code_jsonl --strict; then
-  echo "Conversion is lossy — review before continuing"
-  exit 1
-fi
-```
+**Out:**
+- Streaming/incremental conversion
+- Binary attachment extraction
+- Additional formats (Gemini, etc.)
+- Merging multiple runs
+- Web UI or hosted service
+- Tape compression or rotation
 
 ---
 
-## Performance
+## Self-check
 
-### Complexity
-
-| Operation | Complexity | Notes |
-|---|---|---|
-| Read | O(n) | n = number of input records |
-| Write | O(n × m) | m = average blocks/fields per turn |
-| Loss report | O(l) | l = number of loss entries |
-| Memory | O(n) | Full transcript loaded into memory |
-
-### Benchmarks
-
-Measured on a 2024 Windows laptop with Python 3.14:
-
-| Transcript size | Records | Conversion | Time | Peak RAM |
-|---|---|---|---|---|
-| Small | 10 | Claude → OpenAI | ~2 ms | ~50 KB |
-| Medium | 1,000 | Claude → OpenAI | ~25 ms | ~2 MB |
-| Large | 10,000 | Claude → OpenAI | ~180 ms | ~18 MB |
-
-> These are illustrative numbers from local runs. Actual performance depends on JSON size, block count, and hardware. Streaming/incremental conversion is intentionally out of scope for v1.
-
-### Bottlenecks
-
-1. **JSON parse/serialize** dominates for large transcripts.
-2. **Block traversal** is linear in the number of content blocks.
-3. **Memory** is bounded by loading the entire input and output strings.
-
----
-
-## Development
-
-### Run the self-check
+A single runnable check proves round-trip honesty:
 
 ```bash
 python selfcheck.py
 ```
 
-This proves:
+It builds a canonical transcript with one Claude-specific field (`cache_control`) and one OpenAI-specific field (`name` on a tool message), then asserts:
 
 1. Claude → Claude is lossless.
 2. Claude → OpenAI reports exactly the `cache_control` loss.
-3. OpenAI → Claude reports the OpenAI-specific `name` field as loss.
+3. OpenAI → Claude reports the `name` field as loss.
 4. Claude → OpenAI → Claude preserves content except the expected lossy fields.
-
-### Run per-format self-checks
-
-```bash
-python -m transcript_bridge.canonical
-python -m transcript_bridge.formats.claude_code
-python -m transcript_bridge.formats.openai
-python -m transcript_bridge.formats.codex
-```
-
-### Build and install locally
-
-```bash
-python -m pip install -e .
-transcript-bridge formats
-python -m pip uninstall transcript-bridge -y
-```
-
----
-
-## Contributing
-
-This is an early v1. The most useful contributions are:
-
-1. Additional format readers/writers (Gemini, LangSmith, etc.).
-2. Better handling for binary attachments and multi-part content.
-3. Streaming conversion for very large transcripts.
-4. More comprehensive loss-reason metadata.
-
-Please keep changes small, stdlib-only, and covered by `selfcheck.py` or a new format self-check.
 
 ---
 
@@ -433,8 +317,4 @@ Please keep changes small, stdlib-only, and covered by `selfcheck.py` or a new f
 
 MIT. See [LICENSE](./LICENSE).
 
----
-
-## Acknowledgments
-
-Built as a sibling project to [engramkit](https://github.com/Victorchatter/engramkit), [agent-vcr](https://github.com/Victorchatter/agent-vcr), and [agent-checkpoint](https://github.com/Victorchatter/agent-checkpoint). The canonical envelope borrows their shape but is independent, because `transcript-bridge` is focused on **loss-aware translation**, not recording or resuming.
+Built to make agent transcripts portable. **Convert once, know exactly what made it across.**
