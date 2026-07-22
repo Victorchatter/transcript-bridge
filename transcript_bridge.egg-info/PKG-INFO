@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: transcript-bridge
+Version: 0.1.0
+Summary: Loss-aware conversion between agent transcript formats
+Author: Victor Filtchev
+License: MIT
+Keywords: claude,openai,codex,transcript,agent,jsonl
+Classifier: Development Status :: 4 - Beta
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file

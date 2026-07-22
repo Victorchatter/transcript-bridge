@@ -1,0 +1,2 @@
+[console_scripts]
+transcript-bridge = transcript_bridge.cli:main
