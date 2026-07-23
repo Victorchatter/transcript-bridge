@@ -130,6 +130,8 @@ One JSONL line per conversation turn:
 
 ```bash
 pipx install .
+# or install directly from GitHub:
+pipx install git+https://github.com/Victorchatter/transcript-bridge.git
 ```
 
 Requires Python 3.10+. Zero runtime dependencies.
@@ -213,6 +215,27 @@ transcript-bridge formats
 | `codex` | ✅ | ✅ | Codex CLI traces with extra metadata (`usage`, `checkpoint`, etc.) |
 
 Adding a new format means adding a reader + writer module and one registry line.
+
+### Conversion matrix (field survival)
+
+Derived from the actual readers/writers in `transcript_bridge/formats/*.py` and `canonical.py` / `loss.py`. Rows are canonical fields; columns are target formats. A field is **kept** when it appears in the target output, **loss (reported)** when a loss entry is emitted to stderr / `_meta.loss`, or **stashed in _meta** when it has no native slot and is preserved only on the canonical turn's `_meta` (no loss entry, silently dropped from the serialized target text).
+
+| Canonical field | → Claude Code JSONL | → OpenAI messages | → Codex | → canonical |
+|---|---|---|---|---|
+| `cache_control` | kept | loss (reported) | loss (reported)¹ | kept |
+| `tool_use` / `tool_calls` | kept | kept | kept | kept |
+| `tool_result` | kept | kept | kept | kept |
+| `usage` | stashed in _meta | stashed in _meta | kept (re-emitted)² | stashed in _meta |
+| `checkpoint` / `metadata` | stashed in _meta | stashed in _meta | kept (re-emitted)² | stashed in _meta |
+| OpenAI tool `name` | loss (reported)³ | kept | kept | stashed in _meta |
+| `timestamp` | kept | stashed in _meta | stashed in _meta | kept |
+| `model` | kept | stashed in _meta | stashed in _meta | kept |
+
+¹ Codex writing delegates to the OpenAI writer, so `cache_control` is reported as loss on the OpenAI sub-hop and propagates.
+² Codex-only fields ride in `_meta.source._codex_extra`; the Codex writer re-injects them. They survive a Codex→Codex round-trip but are dropped when the turn is serialized through OpenAI text (the OpenAI writer does not report them as loss — they are stashed, not reported).
+³ `role` itself is always kept; only the OpenAI-specific tool-message `name` field is reported as loss by the Claude Code writer.
+
+> `--strict` fails (exit code 2) on any cell marked **loss (reported)**.
 
 ---
 

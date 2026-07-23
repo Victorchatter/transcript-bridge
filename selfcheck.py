@@ -57,6 +57,7 @@ def _strip_meta(turn):
 def main():
     read_cc, write_cc = FORMATS["claude_code_jsonl"]
     read_oa, write_oa = FORMATS["openai_messages"]
+    read_cx, write_cx = FORMATS["codex"]
 
     original = _make_claude_transcript()
 
@@ -89,6 +90,33 @@ def main():
     _, name_losses = write_cc(oa_turns)
     assert any("_openai_name" in loss["path"] or "name" in loss["reason"].lower()
                for loss in name_losses), name_losses
+
+    # 5. Codex usage/checkpoint: stashed in _meta on the OpenAI hop, re-emitted
+    #    on the Codex hop. Note: the OpenAI writer does NOT report usage as loss
+    #    (it is stashed in _meta.source._codex_extra, not surfaced as a loss
+    #    entry), so we assert absence from the OpenAI output rather than a loss.
+    codex_lines = [
+        json.dumps({"role": "assistant", "content": "Hi!",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+                    "checkpoint": "chk_1"}),
+    ]
+    cx_turns = read_cx("\n".join(codex_lines))
+    extra = cx_turns[0]["_meta"]["source"].get("_codex_extra", {})
+    assert extra.get("usage") == {"prompt_tokens": 10, "completion_tokens": 4}
+    assert extra.get("checkpoint") == "chk_1"
+
+    # OpenAI hop: usage/checkpoint have no slot and are not reported as loss.
+    oa_from_cx, oa_from_cx_losses = write_oa(cx_turns)
+    oa_msgs = json.loads(oa_from_cx)
+    assert "usage" not in oa_msgs[0] and "checkpoint" not in oa_msgs[0]
+    assert not any("usage" in l["path"] or "checkpoint" in l["path"] for l in oa_from_cx_losses)
+
+    # Codex hop: usage/checkpoint re-emitted from _meta.source._codex_extra.
+    cx_back, cx_back_losses = write_cx(cx_turns)
+    cx_records = [json.loads(l) for l in cx_back.strip().split("\n")]
+    assert cx_records[0]["usage"] == {"prompt_tokens": 10, "completion_tokens": 4}
+    assert cx_records[0]["checkpoint"] == "chk_1"
+    assert not cx_back_losses
 
     print("selfcheck OK")
     return 0
