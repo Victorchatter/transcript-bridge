@@ -17,6 +17,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Victorchatter/transcript-bridge"
+Repository = "https://github.com/Victorchatter/transcript-bridge"
+
 [project.scripts]
 transcript-bridge = "transcript_bridge.cli:main"
 
