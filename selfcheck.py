@@ -54,6 +54,66 @@ def _strip_meta(turn):
     return t
 
 
+def _make_tape():
+    """A minimal agent-vcr tape: request, tool call, tool result, response."""
+    def L(o):
+        return json.dumps(o)
+    req = L({"system": "You are careful.",
+             "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+             "messages": [{"role": "user", "content": "audit this repo"}]})
+    return "\n".join([
+        L({"kind": "model_request", "seq": 1, "provider": "anthropic", "body": req}),
+        L({"kind": "tool_call", "seq": 2, "server": "fs", "tool": "read",
+           "args": {"p": "/a.py"}, "args_hash": "h1"}),
+        L({"kind": "tool_result", "seq": 3, "server": "fs", "tool": "read",
+           "args_hash": "h1", "result": {"text": "x = 1"}}),
+        L({"kind": "model_response", "seq": 4, "provider": "anthropic",
+           "body": L({"content": [{"type": "text", "text": "Found it."}]}),
+           "usage": {"input_tokens": 100, "output_tokens": 10}}),
+    ]) + "\n"
+
+
+def check_tape():
+    """agent-vcr tape -> canonical -> OpenAI.
+
+    This is the cross-tool interop the LocalLab README advertises. It is
+    asserted here so it cannot rot silently. The reader must emit the same
+    canonical shape as the other readers (Anthropic-style content blocks plus
+    separate role="tool" turns) — an earlier version emitted a bare string and
+    side fields, which the writers dropped while still reporting "no loss".
+    """
+    read_tape, write_tape = FORMATS["tape"]
+    turns = read_tape(_make_tape())
+
+    roles = [t["role"] for t in turns]
+    assert roles == ["user", "assistant", "tool", "assistant"], roles
+
+    tool_uses = [b for t in turns if isinstance(t.get("content"), list)
+                 for b in t["content"] if b.get("type") == "tool_use"]
+    assert len(tool_uses) == 1, tool_uses
+    assert tool_uses[0]["name"] == "read", tool_uses[0]
+    assert tool_uses[0]["input"] == {"p": "/a.py"}, tool_uses[0]
+
+    # The tool call and its result must survive conversion, not vanish silently.
+    _, write_oa = FORMATS["openai_messages"]
+    oa_text, _ = write_oa(turns)
+    oa = json.loads(oa_text)
+    assert any(m.get("tool_calls") for m in oa), "tool_calls lost converting tape -> openai"
+    assert any(m.get("role") == "tool" for m in oa), "tool result lost converting tape -> openai"
+
+    # Usage is preserved in _meta rather than discarded.
+    assert any(t["_meta"]["source"].get("usage") for t in turns), "usage not carried into _meta"
+
+    # Writing a tape is refused by design — canonical turns cannot reconstruct
+    # wire traffic, and fabricating it would be worse than refusing.
+    try:
+        write_tape(turns)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("write_tape must refuse; a fabricated tape is not replayable")
+
+
 def main():
     read_cc, write_cc = FORMATS["claude_code_jsonl"]
     read_oa, write_oa = FORMATS["openai_messages"]
@@ -117,6 +177,8 @@ def main():
     assert cx_records[0]["usage"] == {"prompt_tokens": 10, "completion_tokens": 4}
     assert cx_records[0]["checkpoint"] == "chk_1"
     assert not cx_back_losses
+
+    check_tape()
 
     print("selfcheck OK")
     return 0
