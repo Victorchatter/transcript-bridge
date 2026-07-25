@@ -197,3 +197,72 @@ transcript-bridge/
 - `# ponytail:` comments mark deliberate simplifications.
 - Round-trip honesty is more important than perfect fidelity to every exotic field. Unknown fields are loss-reported, not silently dropped.
 - The canonical model is a *sibling* to agent-checkpoint's envelope, not a fork or a dependency. It borrows the same shape (`role`, `content`, `tool_calls`, `tool_results`, `provider`, `model`, `ts`) but adds `_meta` and treats block-array content as the canonical truth.
+
+---
+
+## Addendum — 2026-07-25
+
+Added retroactively while writing the Phase 2a specs. The original spec above
+is the approved design record and is unchanged. These three sections document
+what the implementation actually settled on, and the parser contract below is
+the direct input to the `localab-core` extraction (Phase 2d).
+
+## Parser interface (the contract sibling tools should reuse)
+
+Every format module in `transcript_bridge/formats/` exposes exactly two functions with this shape:
+
+```python
+def read_<format>(text: str) -> list[dict]:          # canonical turns
+    ...
+
+def write_<format>(turns: list[dict]) -> tuple[str, list[dict]]:  # (output_text, losses)
+    ...
+```
+
+Both are pure functions: text/turns in, text/turns out, no filesystem or network access inside the reader/writer itself (I/O — opening files, reading stdin — happens once in `cli.py`, not inside format modules). This is what makes them reusable as a library, not just as CLI internals: `from transcript_bridge.formats import claude_code; turns = claude_code.read_claude_code_jsonl(text)` works standalone.
+
+Registered in `transcript_bridge/__init__.py`:
+
+```python
+FORMATS = {
+    "claude_code_jsonl": (claude_code.read_claude_code_jsonl, claude_code.write_claude_code_jsonl),
+    "openai_messages":   (openai.read_openai_messages,       openai.write_openai_messages),
+    "codex":             (codex.read_codex,                  codex.write_codex),
+}
+```
+
+`FORMATS` is the lookup table the CLI (`cli.py:_get_rw`) uses to resolve `--from`/`--to` names to callables. It is also the intended reuse surface for other tools: import `transcript_bridge.FORMATS` (or the individual `formats.*` module functions) rather than re-parsing Claude Code JSONL or OpenAI messages from scratch.
+
+
+## Module map
+
+```
+transcript-bridge/
+├── transcript_bridge/
+│   ├── __init__.py          # __version__, FORMATS registry
+│   ├── canonical.py         # make_turn, read_jsonl, write_jsonl
+│   ├── loss.py               # make_loss, report
+│   ├── cli.py                # argparse CLI: main(argv), _get_rw
+│   └── formats/
+│       ├── __init__.py
+│       ├── claude_code.py    # read_claude_code_jsonl / write_claude_code_jsonl
+│       ├── openai.py         # read_openai_messages / write_openai_messages
+│       └── codex.py          # read_codex / write_codex (delegates to openai.py)
+├── selfcheck.py               # round-trip + loss-report proof, plain asserts
+├── pyproject.toml             # pipx-installable, stdlib only, Python 3.10+
+├── LICENSE                    # MIT
+└── README.md
+```
+
+
+## Known gaps
+
+**Sibling tool `transcript-to-test` does not reuse transcript-bridge's parsers.** It ships its own `transcript_to_test/canonical.py` and `transcript_to_test/readers/{claude_code,openai,tape}.py`, duplicating the Claude Code and OpenAI parsing logic. This is called out explicitly in its own source:
+
+- `transcript_to_test/readers/claude_code.py`: `"# ponytail: duplicates the Claude Code parser shape from transcript-bridge. A shared helper could be extracted later; for v1 each tool keeps its own parser so it stays standalone."`
+- `transcript_to_test/canonical.py`: `"Shape mirrors transcript-bridge/agent-checkpoint so the three projects stay conceptually aligned. This module only carries the fields transcript-to-test needs; it does not implement the full loss model."`
+
+So the duplication is intentional and acknowledged, not accidental — each tool was kept installable standalone (no cross-package dependency) at the cost of parser drift risk. Similarly, **agent-checkpoint** defines its own canonical envelope and its own Claude Code / OpenAI parsers (`agent_checkpoint/format.py`, `agent_checkpoint/parsers/`) rather than importing `transcript_bridge` — same pattern, same tradeoff, not currently reconciled.
+
+If transcript-bridge is meant to become the actual shared dependency (per its framing as "the tool everything else will depend on" for a later phase), the next step is not a code change here — it's deciding whether `transcript-to-test` and `agent-checkpoint` should add `transcript-bridge` as a runtime dependency and import its `formats.*` readers/writers directly, replacing their local duplicates. That decision, and the resulting refactor, is out of scope for this spec.
+
