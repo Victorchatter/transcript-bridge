@@ -7,6 +7,10 @@ and one OpenAI-specific field (name on a tool message), then proves:
 2. Claude -> OpenAI reports exactly the cache_control loss.
 3. OpenAI -> Claude reports the OpenAI-specific name as loss.
 4. Claude -> OpenAI -> Claude preserves content except the lossy fields.
+5. Gemini -> Gemini round-trips text/function parts and reports id/system loss.
+6. Ollama -> Ollama round-trips messages/tool_calls and reports id loss.
+7. LangSmith read + write reports metadata/tags/latency/scores/spans loss.
+8. Langfuse read + write reports modelParameters/usage/scores/release/metadata loss.
 """
 import json
 import sys
@@ -114,6 +118,164 @@ def check_tape():
         raise AssertionError("write_tape must refuse; a fabricated tape is not replayable")
 
 
+def check_gemini():
+    """Gemini round-trip: text + functionCall/functionResponse survive; ids and
+    system flattening are reported as loss."""
+    read_gm, write_gm = FORMATS["gemini"]
+    body = {
+        "systemInstruction": {"parts": [{"text": "You are helpful."}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": "Read /x."}]},
+            {"role": "model", "parts": [
+                {"text": "I'll read it."},
+                {"functionCall": {"name": "Read", "args": {"file_path": "/x"}}},
+            ]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "Read", "response": {"result": "contents"}}}]},
+        ],
+    }
+    turns = read_gm(json.dumps(body))
+    assert turns[0]["role"] == "system"
+    assert turns[1]["role"] == "user"
+    assert turns[2]["role"] == "assistant"
+    assert turns[2]["tool_calls"][0]["function"]["name"] == "Read"
+    assert turns[3]["role"] == "tool"
+
+    gm_text, gm_losses = write_gm(turns)
+    gm_data = json.loads(gm_text)
+    assert gm_data["contents"][1]["role"] == "model"
+    assert gm_data["contents"][1]["parts"][1]["functionCall"]["name"] == "Read"
+    assert gm_data["contents"][2]["parts"][0]["functionResponse"]["name"] == "Read"
+    assert any("system" in l["path"] for l in gm_losses), gm_losses
+    assert any("id" in l["path"] for l in gm_losses), gm_losses
+    assert any("safety" in l["path"] for l in gm_losses), gm_losses
+
+    # Round-trip back to canonical and verify roles/text preserved.
+    gm_turns = read_gm(gm_text)
+    assert gm_turns[2]["content"][0]["text"] == "I'll read it."
+    assert gm_turns[2]["content"][1]["name"] == "Read"
+
+
+def check_ollama():
+    """Ollama round-trip: messages and tool_calls survive; id is reported loss."""
+    read_om, write_om = FORMATS["ollama"]
+    body = {
+        "model": "llama3.1",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Read /x."},
+            {"role": "assistant", "content": "I'll read it.", "tool_calls": [
+                {"function": {"name": "Read", "arguments": {"file_path": "/x"}}}
+            ]},
+            {"role": "tool", "content": "contents of /x", "tool_call_id": "ollama_fn_Read_0"},
+        ],
+        "stream": False,
+    }
+    turns = read_om(json.dumps(body))
+    assert len(turns) == 4
+    assert turns[2]["tool_calls"][0]["function"]["name"] == "Read"
+    assert turns[3]["role"] == "tool"
+
+    om_text, om_losses = write_om(turns)
+    om_data = json.loads(om_text)
+    assert om_data["messages"][2]["tool_calls"][0]["function"]["name"] == "Read"
+    assert om_data["messages"][3]["role"] == "tool"
+    assert any("id" in l["path"] for l in om_losses), om_losses
+
+    om_turns = read_om(om_text)
+    assert om_turns[2]["content"][0]["text"] == "I'll read it."
+    assert om_turns[2]["content"][1]["name"] == "Read"
+
+
+def check_langsmith():
+    """LangSmith read + write-with-loss preserves message history and reports
+    metadata, tags, latency, scores, and other spans as loss."""
+    read_ls, write_ls = FORMATS["langsmith"]
+    run = {
+        "id": "run_1",
+        "name": "LLM",
+        "run_type": "llm",
+        "inputs": {
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Read /x."},
+            ]
+        },
+        "outputs": {
+            "message": {"role": "assistant", "content": "I'll read it.", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "Read", "arguments": '{"file_path":"/x"}'}}
+            ]}
+        },
+        "child_runs": [
+            {"id": "tool_1", "name": "Read", "run_type": "tool", "inputs": {"file_path": "/x"}, "outputs": {"result": "contents"}},
+        ],
+        "metadata": {"foo": "bar"},
+        "tags": ["dev"],
+        "start_time": "2026-07-28T12:00:00+00:00",
+        "end_time": "2026-07-28T12:00:01+00:00",
+    }
+    turns = read_ls(json.dumps([run]))
+    assert any(t["role"] == "assistant" for t in turns)
+    assert any(t["role"] == "tool" for t in turns)
+
+    ls_text, ls_losses = write_ls(turns)
+    ls_data = json.loads(ls_text)
+    assert ls_data["run_type"] == "llm"
+    assert ls_data["inputs"]["messages"]
+    paths = _loss_paths(ls_losses)
+    assert any("metadata" in p for p in paths), paths
+    assert any("tags" in p for p in paths), paths
+    assert any("latency" in p for p in paths), paths
+    assert any("scores" in p for p in paths), paths
+    assert any("spans" in p for p in paths), paths
+
+
+def check_langfuse():
+    """Langfuse read + write-with-loss preserves messages and reports
+    modelParameters, usage, scores, release/version, and metadata as loss."""
+    read_lf, write_lf = FORMATS["langfuse"]
+    trace = {
+        "id": "trace_1",
+        "name": "test",
+        "release": "v1",
+        "version": "1.0.0",
+        "metadata": {"env": "prod"},
+        "observations": [
+            {
+                "id": "gen_1",
+                "type": "GENERATION",
+                "model": "gpt-4o",
+                "modelParameters": {"temperature": 0},
+                "input": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Read /x."},
+                ],
+                "output": {"role": "assistant", "content": "I'll read it.", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "Read", "arguments": '{"file_path":"/x"}'}}
+                ]},
+                "usage": {"input": 10, "output": 5},
+                "scores": [{"name": "correctness", "value": 1}],
+                "metadata": {"user": "alice"},
+                "observations": [
+                    {"id": "span_1", "type": "SPAN", "name": "Read", "output": {"result": "contents"}},
+                ],
+            }
+        ],
+    }
+    turns = read_lf(json.dumps(trace))
+    assert any(t["role"] == "assistant" for t in turns)
+    assert any(t["role"] == "tool" for t in turns)
+
+    lf_text, lf_losses = write_lf(turns)
+    lf_data = json.loads(lf_text)
+    assert lf_data["observations"][0]["type"] == "GENERATION"
+    paths = _loss_paths(lf_losses)
+    assert any("modelParameters" in p for p in paths), paths
+    assert any("usage" in p for p in paths), paths
+    assert any("scores" in p for p in paths), paths
+    assert any("release" in p for p in paths), paths
+    assert any("metadata" in p for p in paths), paths
+
+
 def main():
     read_cc, write_cc = FORMATS["claude_code_jsonl"]
     read_oa, write_oa = FORMATS["openai_messages"]
@@ -179,6 +341,10 @@ def main():
     assert not cx_back_losses
 
     check_tape()
+    check_gemini()
+    check_ollama()
+    check_langsmith()
+    check_langfuse()
 
     print("selfcheck OK")
     return 0

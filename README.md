@@ -2,7 +2,7 @@
 
 **Loss-aware, vendor-neutral transcript format conversion for AI agents.**
 
-Convert agent session logs between Claude Code JSONL, OpenAI messages, Codex traces, and a canonical JSONL — without silently dropping metadata. Run with Claude, replay with OpenAI, analyze with Codex, and know exactly what survived the trip.
+Convert agent session logs between Claude Code JSONL, OpenAI messages, Codex traces, Gemini contents, LangSmith traces, Langfuse traces, Ollama chat, and a canonical JSONL — without silently dropping metadata. Run with Claude, replay with OpenAI, analyze with Codex, prompt Gemini, debug LangSmith, observe Langfuse, and replay Ollama — while knowing exactly what survived the trip.
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
@@ -23,7 +23,7 @@ Convert agent session logs between Claude Code JSONL, OpenAI messages, Codex tra
 8. [Loss model](#loss-model)
 9. [Project layout](#project-layout)
 10. [Security](#security)
-11. [Scope (v1)](#scope-v1)
+11. [Scope (v2)](#scope-v2)
 12. [Self-check](#self-check)
 13. [License](#license)
 
@@ -62,9 +62,17 @@ flowchart LR
     A["Claude Code JSONL"] -- reader --> C["Canonical turns"]
     B["OpenAI messages"] -- reader --> C
     D["Codex traces"] -- reader --> C
+    I["Gemini contents"] -- reader --> C
+    J["LangSmith traces"] -- reader --> C
+    K["Langfuse traces"] -- reader --> C
+    L["Ollama chat"] -- reader --> C
     C -- writer --> E["Claude Code JSONL"]
     C -- writer --> F["OpenAI messages"]
     C -- writer --> G["Codex traces"]
+    C -- writer --> M["Gemini contents"]
+    C -- writer --> N["LangSmith traces"]
+    C -- writer --> O["Langfuse traces"]
+    C -- writer --> P["Ollama chat"]
     C -- analyzer --> H["Loss report"]
 ```
 
@@ -198,6 +206,38 @@ transcript-bridge session.jsonl --from claude_code_jsonl --to openai_messages --
 cat session.jsonl | transcript-bridge - --from claude_code_jsonl --to codex
 ```
 
+### Convert to Gemini contents
+
+```bash
+transcript-bridge session.jsonl --from claude_code_jsonl --to gemini -o session-gemini.json
+```
+
+The tool calls become `functionCall` parts and tool results become `functionResponse` parts. System messages are flattened into `systemInstruction`. Any `cache_control`, image blocks, or provider metadata are reported as loss.
+
+### Convert to Ollama /api/chat
+
+```bash
+transcript-bridge session.jsonl --from claude_code_jsonl --to ollama -o session-ollama.json
+```
+
+Tool calls are written as Ollama `tool_calls[].function` blocks. Because Ollama function calls have no `id` field, the canonical id is reported as loss.
+
+### Convert a LangSmith trace export to Claude Code JSONL
+
+```bash
+transcript-bridge trace-export.jsonl --from langsmith --to claude_code_jsonl -o session-claude.jsonl
+```
+
+LangSmith LLM runs are extracted from `inputs.messages` and `outputs.message`; child tool runs become canonical `role=tool` turns. Metadata, tags, latency, scores, and other spans are reported as loss.
+
+### Convert a Langfuse trace to OpenAI messages
+
+```bash
+transcript-bridge trace.json --from langfuse --to openai_messages -o session-openai.json
+```
+
+Langfuse `GENERATION` observations become messages, and nested `SPAN` tool observations become tool-result turns. `modelParameters`, token `usage`, scores, release/version, and metadata are reported as loss.
+
 ### List supported formats
 
 ```bash
@@ -213,6 +253,11 @@ transcript-bridge formats
 | `claude_code_jsonl` | ✅ | ✅ | Anthropic-style content blocks (`text`, `tool_use`, `tool_result`) |
 | `openai_messages` | ✅ | ✅ | JSON array of `{role, content, tool_calls}` messages |
 | `codex` | ✅ | ✅ | Codex CLI traces with extra metadata (`usage`, `checkpoint`, etc.) |
+| `gemini` | ✅ | ✅ | Google Gemini `contents[]` with `functionCall`/`functionResponse` parts |
+| `langsmith` | ✅ | ✅ | LangSmith trace export of LLM runs with child tool runs |
+| `langfuse` | ✅ | ✅ | Langfuse trace export of `GENERATION` and `SPAN` observations |
+| `ollama` | ✅ | ✅ | Ollama `/api/chat` request/response message array |
+| `tape` | ✅ | ❌ | agent-vcr wire-level tape (read-only by design) |
 
 Adding a new format means adding a reader + writer module and one registry line.
 
@@ -220,20 +265,27 @@ Adding a new format means adding a reader + writer module and one registry line.
 
 Derived from the actual readers/writers in `transcript_bridge/formats/*.py` and `canonical.py` / `loss.py`. Rows are canonical fields; columns are target formats. A field is **kept** when it appears in the target output, **loss (reported)** when a loss entry is emitted to stderr / `_meta.loss`, or **stashed in _meta** when it has no native slot and is preserved only on the canonical turn's `_meta` (no loss entry, silently dropped from the serialized target text).
 
-| Canonical field | → Claude Code JSONL | → OpenAI messages | → Codex | → canonical |
-|---|---|---|---|---|
-| `cache_control` | kept | loss (reported) | loss (reported)¹ | kept |
-| `tool_use` / `tool_calls` | kept | kept | kept | kept |
-| `tool_result` | kept | kept | kept | kept |
-| `usage` | stashed in _meta | stashed in _meta | kept (re-emitted)² | stashed in _meta |
-| `checkpoint` / `metadata` | stashed in _meta | stashed in _meta | kept (re-emitted)² | stashed in _meta |
-| OpenAI tool `name` | loss (reported)³ | kept | kept | stashed in _meta |
-| `timestamp` | kept | stashed in _meta | stashed in _meta | kept |
-| `model` | kept | stashed in _meta | stashed in _meta | kept |
+| Canonical field | → Claude Code JSONL | → OpenAI messages | → Codex | → Gemini | → LangSmith | → Langfuse | → Ollama | → canonical |
+|---|---|---|---|---|---|---|---|---|
+| `cache_control` | kept | loss (reported) | loss (reported)¹ | loss (reported) | loss (reported) | loss (reported) | loss (reported) | kept |
+| `tool_use` / `tool_calls` | kept | kept | kept | kept⁴ | kept | kept | kept⁵ | kept |
+| `tool_result` | kept | kept | kept | kept | kept | kept | kept | kept |
+| `usage` | stashed in _meta | stashed in _meta | kept (re-emitted)² | loss (reported) | loss (reported) | loss (reported) | loss (reported) | stashed in _meta |
+| `checkpoint` / `metadata` | stashed in _meta | stashed in _meta | kept (re-emitted)² | loss (reported) | loss (reported) | loss (reported) | stashed in _meta | stashed in _meta |
+| OpenAI tool `name` | loss (reported)³ | kept | kept | stashed in _meta | stashed in _meta | stashed in _meta | stashed in _meta | stashed in _meta |
+| `timestamp` | kept | stashed in _meta | stashed in _meta | stashed in _meta | loss (reported) | loss (reported) | stashed in _meta | kept |
+| `model` | kept | stashed in _meta | stashed in _meta | stashed in _meta | stashed in _meta | stashed in _meta | stashed in _meta | kept |
+| `tool_use.id` | kept | kept | kept | loss (reported) | kept | kept | loss (reported) | kept |
+| system turns | kept | kept | kept | loss (flattened)⁶ | kept | kept | kept | kept |
+| multimodal images | kept | loss (reported) | loss (reported) | loss (reported) | loss (reported) | loss (reported) | loss (reported) | kept |
+| safety / grounding / citations | N/A | N/A | N/A | loss (reported) | N/A | N/A | N/A | N/A |
 
 ¹ Codex writing delegates to the OpenAI writer, so `cache_control` is reported as loss on the OpenAI sub-hop and propagates.
 ² Codex-only fields ride in `_meta.source._codex_extra`; the Codex writer re-injects them. They survive a Codex→Codex round-trip but are dropped when the turn is serialized through OpenAI text (the OpenAI writer does not report them as loss — they are stashed, not reported).
 ³ `role` itself is always kept; only the OpenAI-specific tool-message `name` field is reported as loss by the Claude Code writer.
+⁴ Gemini `functionCall` parts carry no `id`, so the writer reports the canonical tool-use id as loss.
+⁵ Ollama `tool_calls[].function` objects carry no `id`, so the writer reports the canonical tool-use id as loss.
+⁶ Gemini has no `system` role inside `contents[]`; system turns are flattened into the top-level `systemInstruction` and reported as loss.
 
 > `--strict` fails (exit code 2) on any cell marked **loss (reported)**.
 
@@ -257,9 +309,15 @@ A loss entry is created whenever a canonical field has no native slot in the tar
 
 | Source field | Target | Outcome |
 |---|---|---|
-| Claude `cache_control` | OpenAI / Codex | Reported as loss |
+| Claude `cache_control` | OpenAI / Codex / Gemini / LangSmith / Langfuse / Ollama | Reported as loss |
 | OpenAI tool `name` | Claude Code JSONL | Reported as loss |
 | Codex `usage`, `checkpoint` | OpenAI messages | Reported as loss (re-emitted when writing back to Codex) |
+| Gemini `inlineData` / `fileData` | canonical | Reported as loss |
+| Gemini `systemInstruction` flattening | Gemini | Reported as loss |
+| Gemini `safetySettings` / grounding / citations | Gemini | Reported as loss |
+| LangSmith metadata / tags / latency / scores / spans | LangSmith | Reported as loss |
+| Langfuse `modelParameters` / `usage` / scores / release / metadata | Langfuse | Reported as loss |
+| Ollama `images` / streaming `done` metadata | Ollama | Reported as loss |
 
 Loss entries are printed to stderr and stored in `_meta.loss` on each canonical turn.
 
@@ -278,7 +336,12 @@ transcript-bridge/
 │       ├── __init__.py
 │       ├── claude_code.py   # Claude Code JSONL reader/writer
 │       ├── openai.py        # OpenAI messages reader/writer
-│       └── codex.py         # Codex trace reader/writer
+│       ├── codex.py         # Codex trace reader/writer
+│       ├── gemini.py        # Gemini contents[] reader/writer
+│       ├── langsmith.py     # LangSmith trace export reader/writer
+│       ├── langfuse.py      # Langfuse trace export reader/writer
+│       ├── ollama.py        # Ollama /api/chat reader/writer
+│       └── tape.py          # agent-vcr tape reader (write refused)
 ├── selfcheck.py             # round-trip + loss-report verification
 ├── pyproject.toml           # pipx-installable, stdlib only
 ├── LICENSE                  # MIT
@@ -298,10 +361,10 @@ Source comments marked with `# ponytail:` are deliberate simplifications.
 
 ---
 
-## Scope (v1)
+## Scope (v2)
 
 **In:**
-- Claude Code JSONL, OpenAI messages, Codex traces
+- Claude Code JSONL, OpenAI messages, Codex traces, Gemini contents, LangSmith traces, Langfuse traces, Ollama chat
 - Canonical JSONL envelope
 - Loss reporting with `--strict`
 - CLI: `transcript-bridge <file> --from X --to Y [-o out] [--strict]`
@@ -312,7 +375,6 @@ Source comments marked with `# ponytail:` are deliberate simplifications.
 **Out:**
 - Streaming/incremental conversion
 - Binary attachment extraction
-- Additional formats (Gemini, etc.)
 - Merging multiple runs
 - Web UI or hosted service
 - Tape compression or rotation
@@ -333,6 +395,10 @@ It builds a canonical transcript with one Claude-specific field (`cache_control`
 2. Claude → OpenAI reports exactly the `cache_control` loss.
 3. OpenAI → Claude reports the `name` field as loss.
 4. Claude → OpenAI → Claude preserves content except the expected lossy fields.
+5. Gemini → Gemini round-trips text and function parts, reporting id and flattening loss.
+6. Ollama → Ollama round-trips messages and tool calls, reporting id loss.
+7. LangSmith read + write reports metadata, tags, latency, scores, and span loss.
+8. Langfuse read + write reports `modelParameters`, usage, scores, release/version, and metadata loss.
 
 ---
 

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "transcript-bridge"
-version = "0.1.0"
+version = "0.3.0"
 description = "Loss-aware conversion between agent transcript formats"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "Victor Filtchev"}]
-keywords = ["claude", "openai", "codex", "transcript", "agent", "jsonl"]
+keywords = ["claude", "openai", "codex", "gemini", "langsmith", "langfuse", "ollama", "transcript", "agent", "jsonl"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",

@@ -120,8 +120,15 @@ def write_openai_messages(turns):
                 msg["content"] = results[0].get("content")
                 if turn.get("_meta", {}).get("source", {}).get("_openai_name"):
                     msg["name"] = turn["_meta"]["source"]["_openai_name"]
-        elif role == "system":
-            msg["content"] = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        elif role in ("system", "user"):
+            if isinstance(content, str):
+                msg["content"] = content
+            elif isinstance(content, list):
+                msg["content"] = "\n".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            else:
+                msg["content"] = json.dumps(content, ensure_ascii=False)
         else:
             msg["content"] = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
         messages.append(msg)

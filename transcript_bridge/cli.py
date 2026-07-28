@@ -2,7 +2,7 @@
 import argparse
 import sys
 
-from . import FORMATS
+from . import DESCRIPTIONS, FORMATS
 from .loss import report
 
 
@@ -20,12 +20,12 @@ def main(argv=None):
         # Special case: bare invocation lists formats, like
         # `transcript-bridge formats`.
         for name in sorted(FORMATS):
-            print(name)
+            print(f"{name:<20} {DESCRIPTIONS.get(name, '')}")
         return 0
 
     if args.file == "formats":
         for name in sorted(FORMATS):
-            print(name)
+            print(f"{name:<20} {DESCRIPTIONS.get(name, '')}")
         return 0
 
     if args.source_format is None or args.target_format is None:
